@@ -31,7 +31,7 @@ func workspaceSettingsHintIntrospectionContext(
 	ctx context.Context,
 	ws *core.Workspace,
 ) (context.Context, *dagql.Server, error) {
-	ctx, err := withWorkspaceClientContext(ctx, ws)
+	ctx, err := core.WithWorkspaceClientContext(ctx, ws)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -304,7 +304,7 @@ func typeInfoFromTypeDef(td *core.TypeDef) (typeLabel, exampleValue string, conf
 }
 
 func listElementTypeInfoFromTypeDef(td *core.TypeDef) (typeLabel, exampleValue string, configurable bool) {
-	if td != nil && isWorkspaceSettingScalarKind(td.Kind) {
+	if td != nil && (isWorkspaceSettingScalarKind(td.Kind) || td.Kind == core.TypeDefKindInterface) {
 		return typeInfoFromTypeDef(td)
 	}
 	return "", "", false

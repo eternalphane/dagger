@@ -193,7 +193,7 @@ func TestWorkspaceConfigWithCompatFallback(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("no config and no compat returns empty config", func(t *testing.T) {
-		cfg, err := workspaceConfigWithCompatFallback(ctx, &core.Workspace{})
+		cfg, err := (&core.Workspace{}).ConfigWithCompatFallback(ctx)
 		require.NoError(t, err)
 		require.Empty(t, cfg.Modules)
 		require.Empty(t, cfg.Ports)
@@ -216,7 +216,7 @@ func TestWorkspaceConfigWithCompatFallback(t *testing.T) {
 
 		ws := &core.Workspace{}
 		ws.SetCompatWorkspace(compat)
-		cfg, err := workspaceConfigWithCompatFallback(ctx, ws)
+		cfg, err := ws.ConfigWithCompatFallback(ctx)
 		require.NoError(t, err)
 		require.Equal(t, []string{"redis", "infra:database"}, cfg.Modules["hello-with-services"].Up.Skip)
 		require.Equal(t, workspace.PortMapping{

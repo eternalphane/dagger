@@ -17,7 +17,7 @@ func (s *workspaceSchema) envList(
 		return dagql.Array[dagql.String]{}, nil
 	}
 
-	cfg, err := readWorkspaceConfig(ctx, parent)
+	cfg, err := parent.Config(ctx)
 	if err != nil {
 		return nil, err
 	}

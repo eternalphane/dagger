@@ -9,271 +9,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/iancoleman/strcase"
-
 	"github.com/dagger/dagger/core"
 	"github.com/dagger/dagger/core/workspace"
 	"github.com/dagger/dagger/dagql"
-	"github.com/dagger/dagger/engine"
 	"github.com/dagger/dagger/util/gitutil"
 )
-
-// moduleRefCycleKey is the context key carrying the chain of in-flight
-// module-reference strings, used to detect reference cycles.
-type moduleRefCycleKey struct{}
-
-// resolveModuleRef detects and resolves a module function reference, wiring
-// one module's function output into another object-typed value: the long form
-// "<module>:<function>" or the short form "<function>" (a workspace entrypoint function).
-//
-// Detection & precedence (commit-on-match, no silent fallback):
-//   - A long-form candidate contains EXACTLY one ":" with non-empty parts on
-//     both sides. Strings containing "://" (URL-ish, e.g. "tcp://...") are
-//     never module refs.
-//   - A short-form candidate has no ":" or "/" and no leading "." (see
-//     workspace.IsShortFormModuleRef). It is committed only if the entrypoint
-//     has that function; otherwise it keeps its ordinary address meaning.
-//   - The first segment is normalized to a gql field name and looked up on the
-//     canonical Query root's object type (the sugared root omits the
-//     entrypoint's constructor). Only if a field of that name EXISTS — AND
-//     carries module provenance (FieldSpec.Module != nil), which distinguishes
-//     a module constructor from a reserved core field like "git" or "secret"
-//     that shares the root namespace — is the string committed as a module ref.
-//   - Once committed, any subsequent failure (unknown function, type mismatch,
-//     cycle) is a HARD error and does NOT fall through to image/URL handling.
-//
-// Return values:
-//   - (true, err): the string was committed as a module ref; err reports the
-//     outcome of resolving it (nil on success).
-//   - (false, nil): the string is not a module ref; the caller's existing
-//     decoding logic should run unchanged.
-//
-// dest must be a typed dagql destination (e.g. *dagql.ObjectResult[*core.Service])
-// so dagql's own typed Select produces the type-mismatch error.
-func resolveModuleRef(ctx context.Context, addr string, dest any) (matched bool, err error) {
-	// URL-ish strings are never module refs.
-	if strings.Contains(addr, "://") {
-		return false, nil
-	}
-	module, rest, ok := strings.Cut(addr, ":")
-	shortForm := false
-	switch {
-	case !ok:
-		// Short form: resolve "<function>" as "<entrypoint>:<function>".
-		if !workspace.IsShortFormModuleRef(addr) {
-			return false, nil
-		}
-		entrypoint, found := workspaceEntrypointModuleName(ctx)
-		if !found {
-			return false, nil
-		}
-		module, rest, shortForm = entrypoint, addr, true
-	case module == "" || rest == "":
-		return false, nil
-	}
-
-	// The entrypoint's constructor only exists on the canonical server.
-	srv := dagql.CurrentDagqlServer(ctx)
-	if srv == nil {
-		return false, nil
-	}
-	srv = srv.Canonical()
-	root := srv.Root()
-	moduleField := strcase.ToLowerCamel(module)
-	// Detect whether the module is actually installed by checking the Query
-	// root's object type for a field of that name, rather than probing via a
-	// Select. If it is not installed, this is not a module ref.
-	spec, exists := root.ObjectType().FieldSpec(moduleField, srv.View)
-	if !exists {
-		// The name may be an installed workspace module that was not loaded
-		// for this command: selector verbs (`dagger check <mod>:<item>`)
-		// narrow module loading to the modules their patterns name, so a
-		// module referenced only through another module's wiring is never
-		// loaded. When the workspace config installs a module by this name,
-		// demand-load it and retry against the refreshed client schema.
-		// Loading is gated on config membership, so image refs (postgres:16)
-		// never trigger module loads.
-		refreshed, installed, loadErr := demandLoadInstalledModule(ctx, module)
-		if !installed {
-			return false, nil
-		}
-		if loadErr != nil {
-			// Committed: the workspace installs this module, so the string is
-			// a module ref and the load failure is the real error.
-			return true, fmt.Errorf("resolve module reference %q: load module %q: %w", addr, module, loadErr)
-		}
-		srv = refreshed.Canonical()
-		root = srv.Root()
-		spec, exists = root.ObjectType().FieldSpec(moduleField, srv.View)
-		if !exists {
-			return false, nil
-		}
-	}
-	// Core Query fields (host, git, secret, engine, container, http, module, ...)
-	// share the Query root's namespace with module entrypoints, but only
-	// module entrypoints carry module provenance (spec.Module). A field with no
-	// Module is a core field — a reserved word — so leave it to the caller's normal
-	// address decoding (e.g. "git:2.40" or "secret:foo" as an image/URL) rather
-	// than committing it as a module ref.
-	if spec.Module == nil {
-		return false, nil
-	}
-
-	// Committed: from here on, any error is a hard module-ref error.
-
-	// Only "<module>:<function>" (a single function segment) is supported today.
-	// A matching module prefix followed by extra colons (e.g.
-	// "backend:payment:server") is reported explicitly rather than silently
-	// treated as an image ref.
-	if strings.Contains(rest, ":") {
-		return true, fmt.Errorf("invalid module reference %q: only %s:<function> is supported today (a single function segment); got extra segments in %q", addr, module, rest)
-	}
-	functionField := strcase.ToLowerCamel(rest)
-
-	// An unknown function is a hard error for the long form (reported by the
-	// typed Select below) but means "not a module ref" for the short form.
-	var fnSpec dagql.FieldSpec
-	fnExists := false
-	if objType, ok := srv.ObjectType(spec.Type.Type().Name()); ok {
-		fnSpec, fnExists = objType.FieldSpec(functionField, srv.View)
-	}
-	if shortForm && !fnExists {
-		return false, nil
-	}
-
-	// Cycle guard: track the chain of in-flight module refs on the context
-	// and refuse to descend into one already present. Context values propagate
-	// through dagql Select into nested module construction, so re-entry of an
-	// in-flight ref is detectable here. Without this, reference cycles hang the
-	// engine with unbounded goroutine growth.
-	//
-	// The chain stores the NORMALIZED "<moduleField>:<functionField>" (both
-	// lower-camel), not the raw addr, so equivalently-spelled refs (e.g. case
-	// variants like "Foo:Bar" vs "foo:bar") still collide and produce the clean
-	// cycle error instead of wedging on a cache wait. The raw addr is kept in the
-	// user-facing message for readability.
-	normalized := moduleField + ":" + functionField
-	chain, _ := ctx.Value(moduleRefCycleKey{}).([]string)
-	for _, seen := range chain {
-		if seen == normalized {
-			return true, fmt.Errorf("module reference cycle detected: %s -> %s",
-				strings.Join(chain, " -> "), normalized)
-		}
-	}
-	newChain := make([]string, len(chain)+1)
-	copy(newChain, chain)
-	newChain[len(chain)] = normalized
-	ctx = context.WithValue(ctx, moduleRefCycleKey{}, newChain)
-
-	// Resolve by selecting from the Query root into the typed destination: first
-	// the module field, then the function field. dagql's typed Select enforces
-	// that the function's return type matches dest, producing a clear
-	// type-mismatch error.
-	//
-	// Both selectors are built by hand, so a required Workspace! on the
-	// constructor or the function has to be supplied here: dagql rejects a
-	// missing non-null argument in preselect, before the injection hook that
-	// fills workspace args runs (see core.WithBoundWorkspaceArgs). The value
-	// resolves the same way it does everywhere else — the workspace bound into
-	// the context, else the session's current one.
-	ctorArgs := core.WithBoundWorkspaceArgs(ctx, srv, spec.Args.Inputs(srv.View), nil)
-	var fnArgs []dagql.NamedInput
-	if fnExists {
-		fnArgs = core.WithBoundWorkspaceArgs(ctx, srv, fnSpec.Args.Inputs(srv.View), nil)
-	}
-	selectors := []dagql.Selector{
-		{Field: moduleField, Args: ctorArgs},
-		{Field: functionField, Args: fnArgs},
-	}
-	if err := srv.Select(ctx, root, dest, selectors...); err != nil {
-		return true, fmt.Errorf("resolve module reference %q (module %q): %w", addr, module, err)
-	}
-	return true, nil
-}
-
-// demandLoadInstalledModule loads and serves the named workspace module when
-// the workspace config installs it but the current command has not loaded it
-// (selector verbs narrow module loading to the modules their patterns name).
-//
-// Returns installed=false when the name is not an installed workspace module —
-// the caller's normal address decoding should run unchanged. When installed,
-// err reports the load outcome and srv is the refreshed schema served to the
-// current client (which now carries the module as a root field).
-func demandLoadInstalledModule(ctx context.Context, name string) (srv *dagql.Server, installed bool, err error) {
-	q, ws, cfg, ok := currentWorkspaceConfig(ctx)
-	if !ok {
-		return nil, false, nil
-	}
-	// Only the workspace-owning client may trigger module loads from address
-	// resolution. A module client must never demand-load workspace siblings
-	// into its own session — modules only see their declared dependencies,
-	// and this gate keeps a bare string from becoming a capability grant.
-	md, _ := engine.ClientMetadataFromContext(ctx)
-	if md == nil || md.ClientID != ws.ClientID {
-		return nil, false, nil
-	}
-	want := strcase.ToKebab(name)
-	for installedName := range cfg.Modules {
-		if strcase.ToKebab(installedName) == want {
-			installed = true
-			break
-		}
-	}
-	if !installed {
-		return nil, false, nil
-	}
-	// Strict (non-best-effort) load: the consumer's constructor requires this
-	// module, so a load failure is that resolution's real error. This does not
-	// undo best-effort operations like `dagger generate`: their own initial
-	// best-effort pass records a failed module, EnsureWorkspaceModules returns
-	// the recorded error here without reloading, and ModTree runs nodes
-	// without fail-fast — so only the node that genuinely needs the broken
-	// module fails, and repair generators keep running.
-	if _, err := q.Server.EnsureWorkspaceModules(ctx, []string{name}, core.ModuleLoadStrict); err != nil {
-		return nil, true, err
-	}
-	deps, err := q.Server.CurrentServedDeps(ctx)
-	if err != nil {
-		return nil, true, err
-	}
-	srv, err = deps.Schema(ctx)
-	if err != nil {
-		return nil, true, err
-	}
-	return srv, true, nil
-}
-
-// currentWorkspaceConfig returns the current query with its workspace and
-// config, or ok=false when there is none (errors are deliberately discarded).
-func currentWorkspaceConfig(ctx context.Context) (q *core.Query, ws *core.Workspace, cfg *workspace.Config, ok bool) {
-	q, _ = core.CurrentQuery(ctx)
-	if q == nil {
-		return nil, nil, nil, false
-	}
-	ws, _ = q.Server.CurrentWorkspace(ctx)
-	if ws == nil {
-		return nil, nil, nil, false
-	}
-	cfg, _ = workspaceConfigWithCompatFallback(ctx, ws)
-	if cfg == nil {
-		return nil, nil, nil, false
-	}
-	return q, ws, cfg, true
-}
-
-// workspaceEntrypointModuleName returns the install name of the entrypoint module.
-func workspaceEntrypointModuleName(ctx context.Context) (string, bool) {
-	_, _, cfg, ok := currentWorkspaceConfig(ctx)
-	if !ok {
-		return "", false
-	}
-	for name, entry := range cfg.Modules {
-		if entry.Entrypoint {
-			return name, true
-		}
-	}
-	return "", false
-}
 
 // isBareRefShaped reports whether addr looks like it was intended as a bare
 // module reference "<module>:<function>" — exactly one ":", no "://", and no
@@ -374,7 +114,7 @@ func (s *addressSchema) file(
 ) {
 	var q []dagql.Selector
 	addr := r.Self().Value
-	if matched, err := resolveModuleRef(ctx, addr, &inst); matched {
+	if matched, err := core.ResolveModuleRef(ctx, addr, &inst); matched {
 		return inst, err
 	}
 	gitURL, err := gitutil.ParseURL(addr)
@@ -466,7 +206,7 @@ func (s *addressSchema) directory(
 ) {
 	var q []dagql.Selector
 	addr := r.Self().Value
-	if matched, err := resolveModuleRef(ctx, addr, &inst); matched {
+	if matched, err := core.ResolveModuleRef(ctx, addr, &inst); matched {
 		return inst, err
 	}
 	gitURL, err := gitutil.ParseURL(addr)
@@ -544,7 +284,7 @@ func (s *addressSchema) container(
 	err error,
 ) {
 	addr := r.Self().Value
-	if matched, err := resolveModuleRef(ctx, addr, &inst); matched {
+	if matched, err := core.ResolveModuleRef(ctx, addr, &inst); matched {
 		// The address named an installed module: it is committed as a
 		// module reference. Any failure here is hard and must not fall
 		// through to image interpretation. An image ref shadowed by a module
@@ -796,7 +536,7 @@ func (s *addressSchema) service(
 	// A bare "<module>:<function>" naming an installed module is
 	// committed as a module reference; any failure here is hard and does not
 	// fall through to tcp:///udp:// interpretation.
-	if matched, err := resolveModuleRef(ctx, addr, &inst); matched {
+	if matched, err := core.ResolveModuleRef(ctx, addr, &inst); matched {
 		return inst, err
 	}
 	// wrapFallback annotates fallback URL/host-port parse failures for
@@ -880,10 +620,10 @@ func (s *addressSchema) workspace(
 	err error,
 ) {
 	addr := r.Self().Value
-	if matched, err := resolveModuleRef(ctx, addr, &inst); matched {
+	if matched, err := core.ResolveModuleRef(ctx, addr, &inst); matched {
 		return inst, err
 	}
-	return inst, fmt.Errorf("workspace address %q must reference an installed module as <module>:<function>", addr)
+	return inst, fmt.Errorf("workspace address %q must reference an installed module as %s", addr, workspace.ModuleRefPlaceholder)
 }
 
 func (s *addressSchema) volume(
@@ -903,7 +643,7 @@ func (s *addressSchema) volume(
 	}
 
 	addr := r.Self().Value
-	if matched, err := resolveModuleRef(ctx, addr, &inst); matched {
+	if matched, err := core.ResolveModuleRef(ctx, addr, &inst); matched {
 		return inst, err
 	}
 

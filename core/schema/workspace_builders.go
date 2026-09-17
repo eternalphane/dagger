@@ -40,11 +40,11 @@ func (s *workspaceSchema) loadWorkspaceConfigForOverlay(
 
 	configDir := workspaceConfigDirectoryForWrite(ws, here)
 	if ws.ConfigFile != "" && (!here || workspaceSameConfigDirectory(ws, workspaceConfigDirectoryForWrite(ws, true))) {
-		configFile, err := workspaceConfigFile(ws)
+		configFile, err := ws.ConfigFilePath()
 		if err != nil {
 			return nil, err
 		}
-		data, err := readConfigBytes(ctx, ws)
+		data, err := ws.ConfigBytes(ctx)
 		if err != nil {
 			return nil, err
 		}

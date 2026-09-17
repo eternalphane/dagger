@@ -100,7 +100,7 @@ func (s *workspaceSchema) workspaceOverlayModulesWithLoadFailures(
 		return nil, nil, nil
 	}
 
-	configFile, err := workspaceConfigFile(ws)
+	configFile, err := ws.ConfigFilePath()
 	if err != nil {
 		return nil, nil, err
 	}
@@ -112,7 +112,7 @@ func (s *workspaceSchema) workspaceOverlayModulesWithLoadFailures(
 	// suspect; otherwise only the entries whose source tree was edited are.
 	configTouched := ws.IsValueWorkspace() || ws.OverlayPathTouched(configFile)
 
-	cfg, err := readWorkspaceConfig(ctx, ws)
+	cfg, err := ws.Config(ctx)
 	if err != nil {
 		return nil, nil, err
 	}

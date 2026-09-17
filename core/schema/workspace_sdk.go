@@ -22,7 +22,7 @@ func (s *workspaceSchema) sdks(
 		return dagql.ObjectResultArray[*core.WorkspaceSDK]{}, nil
 	}
 
-	cfg, err := readWorkspaceConfig(ctx, ws)
+	cfg, err := ws.Config(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +66,7 @@ func (s *workspaceSchema) sdk(
 	configDir := "."
 	if ws.ConfigFile != "" {
 		var err error
-		cfg, err = readWorkspaceConfig(ctx, ws)
+		cfg, err = ws.Config(ctx)
 		if err != nil {
 			return dagql.ObjectResult[*core.WorkspaceSDK]{}, err
 		}

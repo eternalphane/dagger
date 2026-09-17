@@ -1130,16 +1130,6 @@ func (s *workspaceSchema) workspaceOverlayRootfs(ctx context.Context, ws *core.W
 	return s.resolveRootfs(ctx, ws, ".", core.CopyFilter{}, false)
 }
 
-func requireLocalWorkspace(ws *core.Workspace, operation string) error {
-	if ws == nil {
-		return fmt.Errorf("workspace is required")
-	}
-	if ws.HostPath() == "" {
-		return fmt.Errorf("%s is local-only", operation)
-	}
-	return nil
-}
-
 func workspaceFilterWithDirectoryArgs(dirID *call.ID, filter core.CopyFilter, gitignore bool) []dagql.NamedInput {
 	withDirArgs := []dagql.NamedInput{
 		{Name: "path", Value: dagql.NewString("/")},
@@ -2452,7 +2442,7 @@ func (s *workspaceSchema) reloaded(
 	// workspace has no owning client and no host reads to invalidate, so the
 	// bump is skipped rather than failed.
 	if parent.Self().ClientID != "" {
-		bumpCtx, err := withWorkspaceClientContext(ctx, parent.Self())
+		bumpCtx, err := core.WithWorkspaceClientContext(ctx, parent.Self())
 		if err != nil {
 			return dagql.ObjectResult[*core.Workspace]{}, err
 		}
@@ -3750,7 +3740,7 @@ func (s *workspaceSchema) checks(
 	noGenerate := args.NoGenerate.GetOr(false).Bool()
 	onlyGenerate := args.OnlyGenerate.GetOr(false).Bool()
 
-	cfg, err := workspaceConfigWithCompatFallback(ctx, parent)
+	cfg, err := parent.ConfigWithCompatFallback(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -4163,7 +4153,7 @@ func (s *workspaceSchema) services(
 
 	// Resolve port mappings from the workspace config's top-level [ports.<host>]
 	// declarations.
-	wsCfg, err := workspaceConfigWithCompatFallback(ctx, parent)
+	wsCfg, err := parent.ConfigWithCompatFallback(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -4448,28 +4438,6 @@ func currentWorkspacePrimaryModules(ctx context.Context) ([]dagql.ObjectResult[*
 	return mods, nil
 }
 
-// workspaceConfigWithCompatFallback returns the real workspace config when it
-// exists, the shared legacy compat projection when it does not, or an empty
-// config for workspaces with neither.
-func workspaceConfigWithCompatFallback(
-	ctx context.Context,
-	ws *core.Workspace,
-) (*workspace.Config, error) {
-	if ws.ConfigFile != "" {
-		cfg, err := readWorkspaceConfig(ctx, ws)
-		if err != nil {
-			return nil, err
-		}
-		return cfg, nil
-	}
-
-	if compat := ws.CompatWorkspace(); compat != nil {
-		return compat.WorkspaceConfig(), nil
-	}
-
-	return &workspace.Config{}, nil
-}
-
 // workspaceConfigSkipPatterns reads per-module skip patterns from the served
 // workspace config shape, keyed by module name. In legacy compat workspaces,
 // there is no dagger.toml yet, so use the shared compat projection that
@@ -4479,7 +4447,7 @@ func workspaceConfigSkipPatterns(
 	ws *core.Workspace,
 	getter func(workspace.ModuleEntry) []string,
 ) (map[string][]string, error) {
-	cfg, err := workspaceConfigWithCompatFallback(ctx, ws)
+	cfg, err := ws.ConfigWithCompatFallback(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -4588,7 +4556,7 @@ func filterNodesByInclude[T any](
 // replace ClientScope, so runtime-backed operations remain authorized by the
 // caller's held scope rather than metadata selecting another executable runtime.
 func (s *workspaceSchema) withWorkspaceClientContext(ctx context.Context, ws *core.Workspace) (context.Context, error) {
-	return withWorkspaceClientContext(ctx, ws)
+	return core.WithWorkspaceClientContext(ctx, ws)
 }
 
 // withWorkspaceHostReadContext is withWorkspaceClientContext plus the client's
@@ -4601,7 +4569,7 @@ func (s *workspaceSchema) withWorkspaceClientContext(ctx context.Context, ws *co
 // earlier in the same session. Use it for host reads that must reflect on-disk
 // content (Workspace.file / Workspace.directory and the diff base of edits).
 func (s *workspaceSchema) withWorkspaceHostReadContext(ctx context.Context, ws *core.Workspace) (context.Context, error) {
-	ctx, err := withWorkspaceClientContext(ctx, ws)
+	ctx, err := core.WithWorkspaceClientContext(ctx, ws)
 	if err != nil {
 		return nil, err
 	}
@@ -4610,24 +4578,4 @@ func (s *workspaceSchema) withWorkspaceHostReadContext(ctx context.Context, ws *
 		return nil, err
 	}
 	return dagql.WithNamedPerClientCacheScope(ctx, epoch), nil
-}
-
-// withWorkspaceClientContext stamps owner metadata for host/resource routing;
-// the caller's ClientScope remains the only runtime execution authority.
-func withWorkspaceClientContext(ctx context.Context, ws *core.Workspace) (context.Context, error) {
-	if ws.IsValueWorkspace() {
-		return ctx, nil
-	}
-	if ws.ClientID == "" {
-		return nil, fmt.Errorf("workspace has no client ID")
-	}
-	query, err := core.CurrentQuery(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("get current query: %w", err)
-	}
-	clientMetadata, err := query.SpecificClientMetadata(ctx, ws.ClientID)
-	if err != nil {
-		return ctx, fmt.Errorf("get client metadata: %w", err)
-	}
-	return engine.ContextWithClientMetadata(ctx, clientMetadata), nil
 }

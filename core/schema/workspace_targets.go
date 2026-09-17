@@ -30,7 +30,7 @@ func workspaceEntrypointNames(ctx context.Context, ws *core.Workspace) (map[stri
 		}
 	}
 
-	cfg, err := workspaceConfigWithCompatFallback(ctx, ws)
+	cfg, err := ws.ConfigWithCompatFallback(ctx)
 	if err != nil {
 		return nil, err
 	}

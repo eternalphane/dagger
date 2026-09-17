@@ -25,7 +25,7 @@ func (s *workspaceSchema) workspaceModules(
 		return dagql.ObjectResultArray[*core.WorkspaceModule]{}, nil
 	}
 
-	cfg, err := readWorkspaceConfig(ctx, ws)
+	cfg, err := ws.Config(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -193,7 +193,7 @@ func (s *workspaceSchema) loadWorkspaceModule(
 		return nil, nil, fmt.Errorf("workspace module %q has unexpected receiver %T", parent.Self().Name, receiver)
 	}
 	ws := wsResult.Self()
-	cfg, err := readWorkspaceConfig(ctx, ws)
+	cfg, err := ws.Config(ctx)
 	if err != nil {
 		return nil, nil, err
 	}

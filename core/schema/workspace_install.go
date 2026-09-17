@@ -338,7 +338,7 @@ func (s *workspaceSchema) resolveExternalWorkspaceInstallSource(
 	configDir string,
 ) (dagql.ObjectResult[*core.ModuleSource], string, error) {
 	var src dagql.ObjectResult[*core.ModuleSource]
-	ctx, err := withWorkspaceClientContext(ctx, ws)
+	ctx, err := core.WithWorkspaceClientContext(ctx, ws)
 	if err != nil {
 		return src, "", err
 	}

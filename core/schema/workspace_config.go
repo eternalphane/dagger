@@ -10,7 +10,6 @@ import (
 	"github.com/dagger/dagger/core/workspace"
 	"github.com/dagger/dagger/dagql"
 	"github.com/dagger/dagger/engine"
-	"github.com/dagger/dagger/engine/engineutil"
 )
 
 const initialWorkspaceConfig = `# Dagger workspace configuration
@@ -20,18 +19,6 @@ const initialWorkspaceConfig = `# Dagger workspace configuration
 
 [modules]
 `
-
-func workspaceBuildkit(ctx context.Context) (*engineutil.Client, error) {
-	query, err := core.CurrentQuery(ctx)
-	if err != nil {
-		return nil, err
-	}
-	bk, err := query.Engine(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("engine client: %w", err)
-	}
-	return bk, nil
-}
 
 func workspaceConfigDirectoryForWrite(ws *core.Workspace, here bool) string {
 	if here {
@@ -44,18 +31,11 @@ func workspaceConfigDirectoryForWrite(ws *core.Workspace, here bool) string {
 }
 
 func workspaceConfigDirectory(ws *core.Workspace) (string, error) {
-	configFile, err := workspaceConfigFile(ws)
+	configFile, err := ws.ConfigFilePath()
 	if err != nil {
 		return "", err
 	}
 	return filepath.Dir(configFile), nil
-}
-
-func workspaceConfigFile(ws *core.Workspace) (string, error) {
-	if ws.ConfigFile == "" {
-		return "", fmt.Errorf("no dagger.toml found in workspace")
-	}
-	return cleanWorkspaceRelPath(ws.ConfigFile), nil
 }
 
 func workspaceSameConfigDirectory(ws *core.Workspace, configDir string) bool {
@@ -78,94 +58,6 @@ func cleanWorkspaceRelPath(p string) string {
 		return "."
 	}
 	return filepath.Clean(p)
-}
-
-func workspaceHostPath(ws *core.Workspace, rel ...string) (string, error) {
-	if ws == nil {
-		return "", fmt.Errorf("workspace is required")
-	}
-	if err := requireLocalWorkspace(ws, "workspace host access"); err != nil {
-		return "", err
-	}
-
-	parts := append([]string{ws.HostPath()}, rel...)
-	return filepath.Join(parts...), nil
-}
-
-func readConfigBytes(ctx context.Context, ws *core.Workspace) ([]byte, error) {
-	if ws == nil {
-		return nil, fmt.Errorf("workspace is required")
-	}
-	configFile, err := workspaceConfigFile(ws)
-	if err != nil {
-		return nil, err
-	}
-
-	if rootfs, ok := ws.SourceDirectory(); ok && rootfs.Self() != nil {
-		data, err := core.DirectoryReadFile(ctx, rootfs, configFile)
-		if err != nil {
-			return nil, fmt.Errorf("reading config: %w", err)
-		}
-		return data, nil
-	}
-
-	if ws.HostPath() != "" {
-		// Host overlay edits to the config live only in the changeset's delta
-		// side (host overlays store no full read root — see overlayEdit);
-		// untouched configs read straight from the host file below.
-		if deltaRoot, ok := ws.OverlayDeltaRoot(); ok && ws.OverlayPathTouched(configFile) {
-			data, err := core.DirectoryReadFile(ctx, deltaRoot, configFile)
-			if err != nil {
-				return nil, fmt.Errorf("reading config: %w", err)
-			}
-			return data, nil
-		}
-
-		ctx, err = withWorkspaceClientContext(ctx, ws)
-		if err != nil {
-			return nil, err
-		}
-		configPath, err := workspaceHostPath(ws, configFile)
-		if err != nil {
-			return nil, err
-		}
-		bk, err := workspaceBuildkit(ctx)
-		if err != nil {
-			return nil, err
-		}
-
-		data, err := bk.ReadCallerHostFile(ctx, configPath)
-		if err != nil {
-			return nil, fmt.Errorf("reading config: %w", err)
-		}
-		return data, nil
-	}
-
-	rootfs := ws.Rootfs()
-	if rootfs.Self() == nil {
-		return nil, fmt.Errorf("workspace has no host path or rootfs")
-	}
-	data, err := core.DirectoryReadFile(ctx, rootfs, configFile)
-	if err != nil {
-		return nil, fmt.Errorf("reading config: %w", err)
-	}
-	return data, nil
-}
-
-func readWorkspaceConfig(ctx context.Context, ws *core.Workspace) (*workspace.Config, error) {
-	data, err := readConfigBytes(ctx, ws)
-	if err != nil {
-		return nil, err
-	}
-
-	cfg, err := workspace.ParseConfigAt(ctx, data, filepath.Dir(ws.ConfigFile))
-	if err != nil {
-		return nil, err
-	}
-	if cfg.Modules == nil {
-		cfg.Modules = map[string]workspace.ModuleEntry{}
-	}
-	return cfg, nil
 }
 
 type configReadArgs struct {
@@ -195,7 +87,7 @@ func (s *workspaceSchema) configRead(
 		// Env-scoped reads return the effective active config: base values
 		// with the user-level overlay and the selected env applied, env
 		// tables hidden.
-		cfg, err := readWorkspaceConfig(ctx, parent)
+		cfg, err := parent.Config(ctx)
 		if err != nil {
 			return "", err
 		}
@@ -215,7 +107,7 @@ func (s *workspaceSchema) configRead(
 		// User-level overrides merge over the repo config for reads; env
 		// tables stay visible (including user-added envs) since no env is
 		// being applied here.
-		cfg, err := readWorkspaceConfig(ctx, parent)
+		cfg, err := parent.Config(ctx)
 		if err != nil {
 			return "", err
 		}
@@ -231,7 +123,7 @@ func (s *workspaceSchema) configRead(
 		return dagql.String(result), nil
 	}
 
-	data, err := readConfigBytes(ctx, parent)
+	data, err := parent.ConfigBytes(ctx)
 	if err != nil {
 		return "", err
 	}
