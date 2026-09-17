@@ -6950,6 +6950,12 @@ type WorkspaceModuleSetting implements Node {
   """A unique identifier for this WorkspaceModuleSetting."""
   id: ID!
 
+  """
+  Whether the setting is an interface type resolved from a module function
+  reference (<module>:<function>).
+  """
+  isInterface: Boolean!
+
   """Whether the setting accepts a list of values."""
   isList: Boolean!
 

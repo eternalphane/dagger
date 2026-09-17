@@ -31,6 +31,19 @@ type ModuleRef struct {
 	root          dagql.AnyObjectResult
 }
 
+// InterfaceDest is a resolveModuleRef destination for interface-typed
+// settings: instead of exact typed-Select matching, it validates that the
+// referenced function's return type is a subtype of the expected interface
+// before executing the call, then collects the resulting object's ID.
+type InterfaceDest struct {
+	// Expected is the interface typedef the referenced function's return type
+	// must implement.
+	Expected *TypeDef
+
+	// ID is the ID of the referenced function's result, set on success.
+	ID dagql.AnyID
+}
+
 // ResolveModuleRef detects and resolves a module function reference, wiring
 // one module's function output into another object-typed value: the long form
 // "<module>:<function>" or the short form "<function>" (a workspace entrypoint function).
@@ -58,7 +71,8 @@ type ModuleRef struct {
 //     decoding logic should run unchanged.
 //
 // dest must be a typed dagql destination (e.g. *dagql.ObjectResult[*core.Service])
-// so dagql's own typed Select produces the type-mismatch error.
+// so dagql's own typed Select produces the type-mismatch error, or an
+// *InterfaceDest for interface-typed settings.
 //
 // The schema is taken from the context's current dagql server; callers that
 // have already resolved a specific serving schema (e.g. the main client's)
@@ -73,6 +87,22 @@ func ResolveModuleRef(ctx context.Context, addr string, dest any) (matched bool,
 		return matched, err
 	}
 	return true, selectModuleRef(probeCtx, ref, dest)
+}
+
+// moduleRefShaped reports whether value has the shape of a module function
+// reference: the long form "<module>:<function>" (exactly one ":", non-empty
+// parts, no "://" or "/") or the short entrypoint form ("<function>", see
+// workspace.IsShortFormModuleRef). Shape only; commitment still depends on the
+// referenced module being installed.
+func moduleRefShaped(value string) bool {
+	if strings.Contains(value, "://") || strings.Contains(value, "/") {
+		return false
+	}
+	module, rest, ok := strings.Cut(value, ":")
+	if !ok {
+		return workspace.IsShortFormModuleRef(value)
+	}
+	return module != "" && rest != "" && !strings.Contains(rest, ":")
 }
 
 // probeModuleRef detects whether addr is a module function reference and, once
@@ -216,8 +246,13 @@ func probeModuleRef(ctx context.Context, srv *dagql.Server, addr string) (_ *Mod
 // server: first the module field, then the function field, selecting into dest.
 //
 // dest must be a typed dagql destination (e.g. *dagql.ObjectResult[*core.Service])
-// so dagql's own typed Select produces the type-mismatch error.
+// so dagql's own typed Select produces the type-mismatch error, or an
+// *InterfaceDest for interface-typed settings.
 func selectModuleRef(ctx context.Context, ref *ModuleRef, dest any) error {
+	if ifaceDest, ok := dest.(*InterfaceDest); ok {
+		return selectModuleRefAsInterface(ctx, ref, ifaceDest)
+	}
+
 	// Resolve by selecting from the Query root into the typed destination: first
 	// the module field, then the function field. dagql's typed Select enforces
 	// that the function's return type matches dest, producing a clear
@@ -242,4 +277,90 @@ func selectModuleRef(ctx context.Context, ref *ModuleRef, dest any) error {
 		return fmt.Errorf("resolve module reference %q (module %q): %w", ref.addr, ref.module, err)
 	}
 	return nil
+}
+
+// selectModuleRefAsInterface resolves a module function reference used as an
+// interface-typed setting: it statically validates (without executing the
+// referenced function) that the function's declared return type implements the
+// expected interface, then executes the two-stage Select and collects the
+// resulting object's ID.
+func selectModuleRefAsInterface(ctx context.Context, ref *ModuleRef, dest *InterfaceDest) error {
+	expected := dest.Expected
+	if expected == nil ||
+		expected.Kind != TypeDefKindInterface ||
+		!expected.AsInterface.Valid ||
+		expected.AsInterface.Value.Self() == nil {
+		return fmt.Errorf("resolve module reference %q: interface destination has no expected interface typedef", ref.addr)
+	}
+	expectedIface := expected.AsInterface.Value.Self()
+
+	// An unknown function is a hard error reported by the Select below (the
+	// long form is committed once the module matches), so only pre-check the
+	// return type when the function spec exists.
+	if ref.fnExists {
+		if err := ref.checkReturnImplementsInterface(expectedIface); err != nil {
+			return err
+		}
+	}
+
+	ctorArgs := WithBoundWorkspaceArgs(ctx, ref.srv, ref.moduleSpec.Args.Inputs(ref.srv.View), nil)
+	var fnArgs []dagql.NamedInput
+	if ref.fnExists {
+		fnArgs = WithBoundWorkspaceArgs(ctx, ref.srv, ref.fnSpec.Args.Inputs(ref.srv.View), nil)
+	}
+	var result dagql.AnyObjectResult
+	selectors := []dagql.Selector{
+		{Field: ref.moduleField, Args: ctorArgs},
+		{Field: ref.functionField, Args: fnArgs},
+	}
+	if err := ref.srv.Select(ctx, ref.root, &result, selectors...); err != nil {
+		return fmt.Errorf("resolve module reference %q (module %q): %w", ref.addr, ref.module, err)
+	}
+	idResult, err := result.Select(ctx, ref.srv, dagql.Selector{Field: "id"})
+	if err != nil {
+		return fmt.Errorf("resolve module reference %q: get object ID: %w", ref.addr, err)
+	}
+	id, ok := idResult.Unwrap().(dagql.AnyID)
+	if !ok {
+		return fmt.Errorf("resolve module reference %q: unexpected ID type %T", ref.addr, idResult.Unwrap())
+	}
+	dest.ID = id
+	return nil
+}
+
+// checkReturnImplementsInterface statically validates, without executing the
+// referenced function, that its declared return type implements the expected
+// interface — so a mismatching wiring fails before a function with side
+// effects ever runs.
+func (ref *ModuleRef) checkReturnImplementsInterface(expectedIface *InterfaceTypeDef) error {
+	switch returnType := ref.fnSpec.Type.(type) {
+	case *ModuleObject:
+		// Function returns an object: structural Object->Interface check.
+		if returnType.TypeDef == nil || !returnType.TypeDef.IsSubtypeOf(expectedIface) {
+			return ref.interfaceMismatchError(expectedIface)
+		}
+	case *interfaceTypedMarker:
+		// Function returns an interface: Interface->Interface check. The
+		// marker only carries the interface name, so compare the installed
+		// dagql interfaces structurally.
+		if returnType.name != expectedIface.Name {
+			expectedDagql, ok1 := ref.srv.InterfaceType(expectedIface.Name)
+			returnedDagql, ok2 := ref.srv.InterfaceType(returnType.name)
+			if !ok1 || !ok2 || !expectedDagql.SatisfiedByInterface(returnedDagql, ref.srv.View) {
+				return ref.interfaceMismatchError(expectedIface)
+			}
+		}
+	default:
+		return ref.interfaceMismatchError(expectedIface)
+	}
+	return nil
+}
+
+func (ref *ModuleRef) interfaceMismatchError(expectedIface *InterfaceTypeDef) error {
+	returnTypeName := "<unknown>"
+	if ref.fnSpec.Type != nil {
+		returnTypeName = ref.fnSpec.Type.Type().Name()
+	}
+	return fmt.Errorf("resolve module reference %q: function returns %s, which does not implement %s",
+		ref.addr, returnTypeName, expectedIface.Name)
 }

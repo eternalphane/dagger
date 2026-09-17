@@ -846,6 +846,200 @@ type workspaceSettingsModuleFixture struct {
 	main   string
 }
 
+// TestWorkspaceSettingsInterfaceWiring covers interface-typed settings: the
+// value is a module function reference ("<module>:<function>", or the short
+// entrypoint form), statically checked against the constructor arg's
+// interface before the referenced function runs. Unlike object settings,
+// interface settings accept module references only — never addresses.
+func (WorkspaceSuite) TestWorkspaceSettingsInterfaceWiring(ctx context.Context, t *testctx.T) {
+	const consumerEntrypointConfig = `[modules.iface-ref-consumer]
+source = "modules/iface-ref-consumer"
+entrypoint = true
+
+[modules.store-provider]
+source = "modules/store-provider"
+`
+
+	consumerFixture := workspaceSettingsIfaceRefConsumerModule("modules/iface-ref-consumer", "iface-ref-consumer")
+	providerFixture := workspaceSettingsStoreProviderModule("modules/store-provider", "store-provider")
+
+	t.Run("module reference wires the provider's function into the constructor", func(ctx context.Context, t *testctx.T) {
+		// The consumer is the entrypoint, so the store provider is only
+		// demand-loaded when the wiring resolves.
+		workdir := newWorkspaceSettingsWorkdir(ctx, t, consumerEntrypointConfig+`
+[modules.iface-ref-consumer.settings]
+store = "store-provider:serve"
+`, consumerFixture, providerFixture)
+
+		out, err := hostDaggerExec(ctx, t, workdir, "--silent", "call", "store-name")
+		require.NoError(t, err)
+		require.Equal(t, "postgres", strings.TrimSpace(string(out)))
+	})
+
+	t.Run("unset interface setting leaves the optional arg empty", func(ctx context.Context, t *testctx.T) {
+		workdir := newWorkspaceSettingsWorkdir(ctx, t, consumerEntrypointConfig, consumerFixture, providerFixture)
+
+		out, err := hostDaggerExec(ctx, t, workdir, "--silent", "call", "store-name")
+		require.NoError(t, err)
+		require.Equal(t, "none", strings.TrimSpace(string(out)))
+	})
+
+	t.Run("short-form reference expands to the entrypoint module", func(ctx context.Context, t *testctx.T) {
+		// The store provider is the entrypoint, so "serve" means
+		// "store-provider:serve"; the consumer is invoked by module name.
+		workdir := newWorkspaceSettingsWorkdir(ctx, t, `[modules.iface-ref-consumer]
+source = "modules/iface-ref-consumer"
+
+[modules.store-provider]
+source = "modules/store-provider"
+entrypoint = true
+
+[modules.iface-ref-consumer.settings]
+store = "serve"
+`, consumerFixture, providerFixture)
+
+		out, err := hostDaggerExec(ctx, t, workdir, "--silent", "call", "iface-ref-consumer", "store-name")
+		require.NoError(t, err)
+		require.Equal(t, "postgres", strings.TrimSpace(string(out)))
+	})
+
+	t.Run("a non-implementing return type fails without running the function", func(ctx context.Context, t *testctx.T) {
+		workdir := newWorkspaceSettingsWorkdir(ctx, t, consumerEntrypointConfig+`
+[modules.iface-ref-consumer.settings]
+store = "store-provider:broken"
+`, consumerFixture, providerFixture)
+
+		_, err := hostDaggerExec(ctx, t, workdir, "--silent", "call", "store-name")
+		require.Error(t, err)
+		requireErrOut(t, err, "does not implement Store")
+	})
+
+	t.Run("address values are rejected", func(ctx context.Context, t *testctx.T) {
+		workdir := newWorkspaceSettingsWorkdir(ctx, t, consumerEntrypointConfig+`
+[modules.iface-ref-consumer.settings]
+store = "tcp://localhost:5432"
+`, consumerFixture, providerFixture)
+
+		_, err := hostDaggerExec(ctx, t, workdir, "--silent", "call", "store-name")
+		require.Error(t, err)
+		requireErrOut(t, err, "interface setting must be a module reference")
+	})
+
+	t.Run("an unknown module fails with a near-miss hint", func(ctx context.Context, t *testctx.T) {
+		workdir := newWorkspaceSettingsWorkdir(ctx, t, consumerEntrypointConfig+`
+[modules.iface-ref-consumer.settings]
+store = "nope:serve"
+`, consumerFixture, providerFixture)
+
+		_, err := hostDaggerExec(ctx, t, workdir, "--silent", "call", "store-name")
+		require.Error(t, err)
+		requireErrOut(t, err, "no installed module matches")
+	})
+
+	t.Run("settings writes store long-form module references", func(ctx context.Context, t *testctx.T) {
+		workdir := newWorkspaceSettingsWorkdir(ctx, t, consumerEntrypointConfig, consumerFixture, providerFixture)
+
+		_, err := hostDaggerExec(ctx, t, workdir, "module", "settings",
+			"iface-ref-consumer", "store", "store-provider:serve")
+		require.NoError(t, err)
+
+		out, err := hostDaggerExec(ctx, t, workdir, "workspace", "config",
+			"modules.iface-ref-consumer.settings.store")
+		require.NoError(t, err)
+		require.Equal(t, "store-provider:serve", strings.TrimSpace(string(out)))
+
+		out, err = hostDaggerExec(ctx, t, workdir, "--silent", "call", "store-name")
+		require.NoError(t, err)
+		require.Equal(t, "postgres", strings.TrimSpace(string(out)))
+	})
+
+	t.Run("settings writes normalize short-form references against the entrypoint", func(ctx context.Context, t *testctx.T) {
+		workdir := newWorkspaceSettingsWorkdir(ctx, t, `[modules.iface-ref-consumer]
+source = "modules/iface-ref-consumer"
+
+[modules.store-provider]
+source = "modules/store-provider"
+entrypoint = true
+`, consumerFixture, providerFixture)
+
+		_, err := hostDaggerExec(ctx, t, workdir, "module", "settings", "iface-ref-consumer", "store", "serve")
+		require.NoError(t, err)
+
+		out, err := hostDaggerExec(ctx, t, workdir, "workspace", "config",
+			"modules.iface-ref-consumer.settings.store")
+		require.NoError(t, err)
+		require.Equal(t, "store-provider:serve", strings.TrimSpace(string(out)))
+	})
+}
+
+func workspaceSettingsIfaceRefConsumerModule(relDir, name string) workspaceSettingsModuleFixture {
+	return workspaceSettingsModuleFixture{
+		relDir: relDir,
+		name:   name,
+		main: `package main
+
+import "context"
+
+type IfaceRefConsumer struct {
+	Store Store
+}
+
+// A store backend wired in via workspace settings as a module function
+// reference ("store-provider:serve").
+type Store interface {
+	DaggerObject
+	Get(ctx context.Context) (string, error)
+}
+
+func New(
+	// +optional
+	store Store,
+) *IfaceRefConsumer {
+	return &IfaceRefConsumer{Store: store}
+}
+
+// Returns the wired store implementation's name, or "none" when unset.
+func (m *IfaceRefConsumer) StoreName(ctx context.Context) (string, error) {
+	if m.Store == nil {
+		return "none", nil
+	}
+	return m.Store.Get(ctx)
+}
+`,
+	}
+}
+
+func workspaceSettingsStoreProviderModule(relDir, name string) workspaceSettingsModuleFixture {
+	return workspaceSettingsModuleFixture{
+		relDir: relDir,
+		name:   name,
+		main: `package main
+
+import "context"
+
+type StoreProvider struct{}
+
+type PostgresStore struct{}
+
+// Returns a Store implementation for consumers.
+func (m *StoreProvider) Serve() *PostgresStore {
+	return &PostgresStore{}
+}
+
+func (s *PostgresStore) Get(ctx context.Context) (string, error) {
+	return "postgres", nil
+}
+
+type NotAStore struct{}
+
+// Returns an object that does not implement Store.
+func (m *StoreProvider) Broken() *NotAStore {
+	return &NotAStore{}
+}
+`,
+	}
+}
+
 func newWorkspaceSettingsWorkdir(ctx context.Context, t *testctx.T, configTOML string, modules ...workspaceSettingsModuleFixture) string {
 	t.Helper()
 

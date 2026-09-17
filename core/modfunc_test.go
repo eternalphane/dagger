@@ -197,3 +197,49 @@ func resolveImplicitInputString(t *testing.T, input dagql.ImplicitInput, ctx con
 	require.True(t, ok, "expected dagql.String implicit input value, got %T", value)
 	return strVal.String()
 }
+
+// TestTypedefNeedsResolution covers the dispatch table for workspace settings:
+// which arg types resolve their values against the serving schema at call time
+// (objects from addresses, interfaces from module references, lists of either
+// element-wise) versus primitives that bake straight into the call metadata.
+func TestTypedefNeedsResolution(t *testing.T) {
+	t.Parallel()
+
+	dag := moduleRefTestDag(t)
+
+	stringTypeDef := &TypeDef{Kind: TypeDefKindString}
+	objectTypeDef := func(name string) *TypeDef {
+		obj := objectResultForModuleRefTest(t, dag, "object-"+name, NewObjectTypeDef(name, "", nil))
+		return (&TypeDef{}).WithObject(obj)
+	}
+	interfaceTypeDef := func(name string) *TypeDef {
+		iface := objectResultForModuleRefTest(t, dag, "interface-"+name, NewInterfaceTypeDef(name, ""))
+		return (&TypeDef{}).WithInterface(iface)
+	}
+	listTypeDef := func(elem *TypeDef) *TypeDef {
+		list := objectResultForModuleRefTest(t, dag, "list", &ListTypeDef{
+			ElementTypeDef: objectResultForModuleRefTest(t, dag, "list-element", elem),
+		})
+		return (&TypeDef{}).WithListOf(list)
+	}
+
+	tests := []struct {
+		name     string
+		typeDef  *TypeDef
+		resolves bool
+	}{
+		{"nil", nil, false},
+		{"scalar", stringTypeDef, false},
+		{"object", objectTypeDef("Secret"), true},
+		{"interface", interfaceTypeDef("Store"), true},
+		{"list of scalars", listTypeDef(stringTypeDef), false},
+		{"list of objects", listTypeDef(objectTypeDef("Secret")), true},
+		{"list of interfaces", listTypeDef(interfaceTypeDef("Store")), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tt.resolves, typedefNeedsResolution(tt.typeDef))
+		})
+	}
+}

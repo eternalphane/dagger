@@ -17,8 +17,10 @@ type WorkspaceModule struct {
 	Source     string `field:"true" doc:"The module source path."`
 }
 
-var _ dagql.PersistedObject = (*WorkspaceModule)(nil)
-var _ dagql.PersistedObjectDecoder = (*WorkspaceModule)(nil)
+var (
+	_ dagql.PersistedObject        = (*WorkspaceModule)(nil)
+	_ dagql.PersistedObjectDecoder = (*WorkspaceModule)(nil)
+)
 
 func (*WorkspaceModule) Type() *ast.Type {
 	return &ast.Type{
@@ -58,10 +60,13 @@ type WorkspaceModuleSetting struct {
 	DefaultValue string `field:"true" doc:"The constructor argument's declared default, formatted like value, or empty when the argument has no default."`
 	IsList       bool   `field:"true" doc:"Whether the setting accepts a list of values."`
 	IsObject     bool   `field:"true" doc:"Whether the setting is an object type resolved from an address string (Container, Directory, File, Secret, Service, ...), which may be a module reference."`
+	IsInterface  bool   `field:"true" doc:"Whether the setting is an interface type resolved from a module function reference (<module>:<function>)."`
 }
 
-var _ dagql.PersistedObject = (*WorkspaceModuleSetting)(nil)
-var _ dagql.PersistedObjectDecoder = (*WorkspaceModuleSetting)(nil)
+var (
+	_ dagql.PersistedObject        = (*WorkspaceModuleSetting)(nil)
+	_ dagql.PersistedObjectDecoder = (*WorkspaceModuleSetting)(nil)
+)
 
 func (*WorkspaceModuleSetting) Type() *ast.Type {
 	return &ast.Type{
@@ -110,8 +115,10 @@ type WorkspaceSDK struct {
 	Clients []*WorkspaceModule `field:"true" doc:"Clients generated with this SDK."`
 }
 
-var _ dagql.PersistedObject = (*WorkspaceSDK)(nil)
-var _ dagql.PersistedObjectDecoder = (*WorkspaceSDK)(nil)
+var (
+	_ dagql.PersistedObject        = (*WorkspaceSDK)(nil)
+	_ dagql.PersistedObjectDecoder = (*WorkspaceSDK)(nil)
+)
 
 func (*WorkspaceSDK) Type() *ast.Type {
 	return &ast.Type{

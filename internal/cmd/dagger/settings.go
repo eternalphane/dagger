@@ -16,9 +16,11 @@ import (
 )
 
 // workspaceSettingFields lists the setting fields to request, richest first.
-// Older engines lack the later additions (defaultValue, isList, isObject),
-// so loading falls back through this list on "Cannot query field" errors.
+// Older engines lack the later additions (defaultValue, isList, isObject,
+// isInterface), so loading falls back through this list on "Cannot query
+// field" errors.
 var workspaceSettingFields = []string{
+	"key value description defaultValue isList isObject isInterface",
 	"key value description defaultValue isList isObject",
 	"key value description isList isObject",
 	"key value description",
@@ -71,8 +73,10 @@ query WorkspaceModuleFunctions($module: String!) {
 }
 `
 
-var settingsCmd = newSettingsCmd(false)
-var settingsAliasCmd = newSettingsCmd(false)
+var (
+	settingsCmd      = newSettingsCmd(false)
+	settingsAliasCmd = newSettingsCmd(false)
+)
 
 func init() {
 	addWorkspaceHereFlag(settingsCmd)
@@ -231,6 +235,7 @@ type workspaceSetting struct {
 	DefaultValue string
 	IsList       bool
 	IsObject     bool
+	IsInterface  bool
 }
 
 // workspaceSettingDisplayValue renders a setting for output: the configured
@@ -245,10 +250,10 @@ func workspaceSettingDisplayValue(setting workspaceSetting) string {
 
 // normalizeEntrypointFunctionRef rewrites a short-form entrypoint function
 // reference ("image") to the long form the config stores ("provider:image").
-// Only object-typed settings are candidates, so a string setting whose value
-// matches a function name is left alone.
+// Only object- and interface-typed settings are candidates, so a string
+// setting whose value matches a function name is left alone.
 func normalizeEntrypointFunctionRef(ctx context.Context, dag *dagger.Client, setting workspaceSetting, value string) (string, error) {
-	if !setting.IsObject || !workspacepkg.IsShortFormModuleRef(value) {
+	if !(setting.IsObject || setting.IsInterface) || !workspacepkg.IsShortFormModuleRef(value) {
 		return value, nil
 	}
 

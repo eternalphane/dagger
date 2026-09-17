@@ -57,6 +57,18 @@ func TestWorkspaceSettingHintTypeInfo(t *testing.T) {
 			typeDef:      listTypeDef(t, dag, objectTypeDef(t, dag, "Secret")),
 			configurable: false,
 		},
+		{
+			name:         "interface",
+			typeDef:      interfaceTypeDef(t, dag, "Store"),
+			configurable: true,
+			exampleValue: `"<module>:<function>"`,
+		},
+		{
+			name:         "interface list",
+			typeDef:      listTypeDef(t, dag, interfaceTypeDef(t, dag, "Store")),
+			configurable: true,
+			exampleValue: `["<module>:<function>"]`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -81,6 +93,7 @@ func workspaceSettingHintTypeTestDag(t *testing.T) *dagql.Server {
 	dag.InstallObject(dagql.NewClass(dag, dagql.ClassOpts[*core.TypeDef]{Typed: &core.TypeDef{}}))
 	dag.InstallObject(dagql.NewClass(dag, dagql.ClassOpts[*core.ListTypeDef]{Typed: &core.ListTypeDef{}}))
 	dag.InstallObject(dagql.NewClass(dag, dagql.ClassOpts[*core.ObjectTypeDef]{Typed: &core.ObjectTypeDef{}}))
+	dag.InstallObject(dagql.NewClass(dag, dagql.ClassOpts[*core.InterfaceTypeDef]{Typed: &core.InterfaceTypeDef{}}))
 	return dag
 }
 
@@ -89,6 +102,13 @@ func objectTypeDef(t *testing.T, dag *dagql.Server, name string) *core.TypeDef {
 
 	obj := objectResult(t, dag, "object-"+name, core.NewObjectTypeDef(name, "", nil))
 	return (&core.TypeDef{}).WithObject(obj)
+}
+
+func interfaceTypeDef(t *testing.T, dag *dagql.Server, name string) *core.TypeDef {
+	t.Helper()
+
+	iface := objectResult(t, dag, "interface-"+name, core.NewInterfaceTypeDef(name, ""))
+	return (&core.TypeDef{}).WithInterface(iface)
 }
 
 func listTypeDef(t *testing.T, dag *dagql.Server, elem *core.TypeDef) *core.TypeDef {

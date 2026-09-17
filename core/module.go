@@ -97,9 +97,11 @@ func (*Module) TypeDescription() string {
 	return "A Dagger module."
 }
 
-var _ dagql.PersistedObject = (*Module)(nil)
-var _ dagql.PersistedObjectDecoder = (*Module)(nil)
-var _ dagql.HasDependencyResults = (*Module)(nil)
+var (
+	_ dagql.PersistedObject        = (*Module)(nil)
+	_ dagql.PersistedObjectDecoder = (*Module)(nil)
+	_ dagql.HasDependencyResults   = (*Module)(nil)
+)
 
 func (mod *Module) Name() string {
 	return mod.NameField
@@ -375,8 +377,9 @@ func (mod *Module) ObjectUserDefaults(ctx context.Context, objName string) (*Env
 // ApplyWorkspaceDefaultsToTypeDefs updates constructor arg typedefs based on
 // workspace settings, so that --help displays the correct default values.
 // For primitive types (string, int, bool, float), it sets arg.DefaultValue
-// to the JSON representation. For object types (Secret, Directory, etc.),
-// it marks the arg as optional (since a default will be resolved at call time).
+// to the JSON representation. For object types (Secret, Directory, etc.) and
+// interface types, it marks the arg as optional (since a default will be
+// resolved at call time).
 //
 //nolint:gocyclo // intrinsically long state machine; refactoring would hurt clarity
 func (mod *Module) ApplyWorkspaceDefaultsToTypeDefs(ctx context.Context, dag *dagql.Server) error {
@@ -401,7 +404,11 @@ func (mod *Module) ApplyWorkspaceDefaultsToTypeDefs(ctx context.Context, dag *da
 				continue
 			}
 			updatedArg := arg
-			if argSelf.TypeDef.Self().Kind == TypeDefKindObject {
+			// Interface settings, like object ones, resolve their values at call
+			// time (module references), so mark the arg optional rather than
+			// baking a primitive default.
+			argKind := argSelf.TypeDef.Self().Kind
+			if argKind == TypeDefKindObject || argKind == TypeDefKindInterface {
 				if !argSelf.TypeDef.Self().Optional {
 					var updatedTypeDef dagql.ObjectResult[*TypeDef]
 					if err := dag.Select(ctx, argSelf.TypeDef, &updatedTypeDef, dagql.Selector{

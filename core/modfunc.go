@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/dagger/dagger/core/workspace"
 	"github.com/dagger/dagger/internal/buildkit/util/bklog"
 	"github.com/dagger/dagger/util/gitutil"
 	telemetry "github.com/dagger/otel-go"
@@ -245,13 +246,10 @@ func (fn *ModuleFunction) mergeUserDefaultsTypeDefs(ctx context.Context) error {
 		}
 		updatedArgRes := currentArgRes
 		argTypeDef := currentArgRes.Self().TypeDef.Self()
-		if argDefault.IsObject() || (argDefault.IsList() &&
-			argTypeDef != nil &&
-			argTypeDef.Kind == TypeDefKindList &&
-			argTypeDef.AsList.Valid &&
-			argTypeDef.AsList.Value.Self() != nil &&
-			argTypeDef.AsList.Value.Self().ElementTypeDef.Self() != nil &&
-			argTypeDef.AsList.Value.Self().ElementTypeDef.Self().Kind == TypeDefKindObject) {
+		// Object, interface, and list-of-object/interface settings resolve
+		// their values at call time, so the arg is marked optional here
+		// instead of baked with a primitive default.
+		if typedefNeedsResolution(argTypeDef) {
 			var optionalType dagql.ObjectResult[*TypeDef]
 			if err := dag.Select(ctx, currentArgRes.Self().TypeDef, &optionalType, dagql.Selector{
 				Field: "withOptional",
@@ -407,17 +405,47 @@ func (ud *UserDefault) IsObject() bool {
 	return ud.Arg.TypeDef.Self().Kind == TypeDefKindObject
 }
 
+func (ud *UserDefault) IsInterface() bool {
+	return ud.Arg.TypeDef.Self().Kind == TypeDefKindInterface
+}
+
 func (ud *UserDefault) IsList() bool {
 	return ud.Arg.TypeDef.Self().Kind == TypeDefKindList
 }
 
+// typedefNeedsResolution reports whether a settings value for an arg of this
+// typedef must be resolved against the serving schema at call time: object
+// types resolve from address strings (or module references), interface types
+// from module function references, and lists thereof element-wise. Everything
+// else is a primitive that bakes straight into the call metadata.
+func typedefNeedsResolution(typeDef *TypeDef) bool {
+	if typeDef == nil {
+		return false
+	}
+	switch typeDef.Kind {
+	case TypeDefKindObject, TypeDefKindInterface:
+		return true
+	case TypeDefKindList:
+		if !typeDef.AsList.Valid || typeDef.AsList.Value.Self() == nil {
+			return false
+		}
+		elem := typeDef.AsList.Value.Self().ElementTypeDef.Self()
+		return elem != nil &&
+			(elem.Kind == TypeDefKindObject || elem.Kind == TypeDefKindInterface)
+	default:
+		return false
+	}
+}
+
+// needsResolution reports whether this default's value must be resolved
+// against the serving schema (see typedefNeedsResolution) rather than handled
+// as a primitive.
+func (ud *UserDefault) needsResolution() bool {
+	return typedefNeedsResolution(ud.Arg.TypeDef.Self())
+}
+
 func (ud *UserDefault) CallInput(ctx context.Context) (*FunctionCallArgValue, error) {
-	if !ud.IsObject() &&
-		(!ud.IsList() ||
-			!ud.Arg.TypeDef.Self().AsList.Valid ||
-			ud.Arg.TypeDef.Self().AsList.Value.Self() == nil ||
-			ud.Arg.TypeDef.Self().AsList.Value.Self().ElementTypeDef.Self() == nil ||
-			ud.Arg.TypeDef.Self().AsList.Value.Self().ElementTypeDef.Self().Kind != TypeDefKindObject) {
+	if !ud.needsResolution() {
 		return ud.UserDefaultPrimitive.CallInput()
 	}
 	value, err := ud.Value(ctx)
@@ -435,15 +463,7 @@ func (ud *UserDefault) CallInput(ctx context.Context) (*FunctionCallArgValue, er
 }
 
 func (ud *UserDefault) Value(ctx context.Context) (any, error) {
-	if !ud.IsObject() && !ud.IsList() {
-		return ud.UserDefaultPrimitive.Value()
-	}
-	// List of non-object elements (e.g. []string) is handled by the primitive path
-	if ud.IsList() &&
-		ud.Arg.TypeDef.Self().AsList.Valid &&
-		ud.Arg.TypeDef.Self().AsList.Value.Self() != nil &&
-		ud.Arg.TypeDef.Self().AsList.Value.Self().ElementTypeDef.Self() != nil &&
-		ud.Arg.TypeDef.Self().AsList.Value.Self().ElementTypeDef.Self().Kind != TypeDefKindObject {
+	if !ud.needsResolution() {
 		return ud.UserDefaultPrimitive.Value()
 	}
 	query, err := CurrentQuery(ctx)
@@ -470,7 +490,7 @@ func (ud *UserDefault) Value(ctx context.Context) (any, error) {
 		return nil, fmt.Errorf("get main client schema: %w", err)
 	}
 
-	resolveOne := func(userInput, typename string) (any, error) {
+	resolveObject := func(userInput, typename string) (any, error) {
 		var result dagql.AnyObjectResult
 		if err := srv.Select(mainCtx, srv.Root(), &result,
 			dagql.Selector{
@@ -496,9 +516,32 @@ func (ud *UserDefault) Value(ctx context.Context) (any, error) {
 		return id.Unwrap(), nil
 	}
 
+	// An interface setting can only be a module function reference
+	// ("<module>:<function>", or the short entrypoint form): probe it against
+	// the main client's schema — which carries the workspace's installed
+	// modules as root fields — statically check that the referenced function's
+	// return type implements the expected interface, then execute it for its ID.
+	resolveInterface := func(userInput string, expected *TypeDef) (any, error) {
+		if !moduleRefShaped(userInput) {
+			return nil, ud.errorf(nil, "interface setting must be a module reference %s, got %q", workspace.ModuleRefPlaceholder, userInput)
+		}
+		ref, probeCtx, matched, err := probeModuleRef(mainCtx, srv, userInput)
+		if err != nil {
+			return nil, ud.errorf(err, "resolve interface setting")
+		}
+		if !matched {
+			return nil, ud.errorf(nil, "interface setting must be a module reference %s; no installed module matches %q", workspace.ModuleRefPlaceholder, userInput)
+		}
+		var dest InterfaceDest
+		dest.Expected = expected
+		if err := selectModuleRef(probeCtx, ref, &dest); err != nil {
+			return nil, ud.errorf(err, "resolve interface setting")
+		}
+		return dest.ID, nil
+	}
+
 	if ud.IsList() {
-		// "Secret" -> "secret", "GitRef" -> "gitRef", etc (from the element type)
-		typename := ud.Arg.TypeDef.Self().AsList.Value.Self().ElementTypeDef.Self().ToType().Name()
+		elemTypeDef := ud.Arg.TypeDef.Self().AsList.Value.Self().ElementTypeDef.Self()
 		var elements []string
 		if list, ok := jsonListElements(ud.UserInput); ok {
 			for _, item := range list {
@@ -509,7 +552,18 @@ func (ud *UserDefault) Value(ctx context.Context) (any, error) {
 		}
 		ids := make([]any, 0, len(elements))
 		for _, elem := range elements {
-			id, err := resolveOne(strings.TrimSpace(elem), typename)
+			elem = strings.TrimSpace(elem)
+			var id any
+			switch elemTypeDef.Kind {
+			case TypeDefKindObject:
+				// "Secret" -> "secret", "GitRef" -> "gitRef", etc (from the element type)
+				id, err = resolveObject(elem, elemTypeDef.ToType().Name())
+			case TypeDefKindInterface:
+				id, err = resolveInterface(elem, elemTypeDef)
+			default:
+				// Unreachable: needsResolution only admits object/interface elements.
+				return nil, ud.errorf(nil, "unsupported list element kind %s", elemTypeDef.Kind)
+			}
 			if err != nil {
 				return nil, err
 			}
@@ -518,13 +572,16 @@ func (ud *UserDefault) Value(ctx context.Context) (any, error) {
 		return ids, nil
 	}
 
+	if ud.IsInterface() {
+		return resolveInterface(ud.UserInput, ud.Arg.TypeDef.Self())
+	}
+
 	// "Secret" -> "secret", "GitRef" -> "gitRef", etc
-	typename := ud.Arg.TypeDef.Self().ToType().Name()
-	return resolveOne(ud.UserInput, typename)
+	return resolveObject(ud.UserInput, ud.Arg.TypeDef.Self().ToType().Name())
 }
 
 func (ud *UserDefault) DagqlID(ctx context.Context) (dagql.Input, error) {
-	if !ud.IsObject() && !ud.IsList() {
+	if !ud.IsObject() && !ud.IsList() && !ud.IsInterface() {
 		return nil, ud.errorf(nil, "DagqlID(): primitive type has no ID")
 	}
 	value, err := ud.Value(ctx)
@@ -662,14 +719,11 @@ func (fn *ModuleFunction) DynamicInputsForCall(
 			// was explicitly set by the user, skip
 			continue
 		}
-		if argMetadata.TypeDef.Self().Kind != TypeDefKindObject &&
-			(argMetadata.TypeDef.Self().Kind != TypeDefKindList ||
-				!argMetadata.TypeDef.Self().AsList.Valid ||
-				argMetadata.TypeDef.Self().AsList.Value.Self() == nil ||
-				argMetadata.TypeDef.Self().AsList.Value.Self().ElementTypeDef.Self() == nil ||
-				argMetadata.TypeDef.Self().AsList.Value.Self().ElementTypeDef.Self().Kind != TypeDefKindObject) {
-			// Only default objects need processing at this time.
-			// Primitive default values were already processes earlier
+		if !typedefNeedsResolution(argMetadata.TypeDef.Self()) {
+			// Only defaults that resolve against the serving schema need
+			// processing at this time: objects (addresses / module references),
+			// interfaces (module references), and lists of either.
+			// Primitive default values were already processed earlier
 			//  in the flow.
 			// This applies to both types of object defaults:
 			//  1) "contextual args" from `defaultPath` annotations

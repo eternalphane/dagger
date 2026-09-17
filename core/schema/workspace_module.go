@@ -260,6 +260,7 @@ func (s *workspaceSchema) moduleSettings(
 			DefaultValue: hint.DefaultValue,
 			IsList:       hint.IsList,
 			IsObject:     hint.IsObject,
+			IsInterface:  hint.IsInterface,
 		})
 	}
 

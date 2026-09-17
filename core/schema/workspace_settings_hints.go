@@ -19,6 +19,7 @@ type constructorArgHint struct {
 	TypeLabel    string
 	IsList       bool
 	IsObject     bool
+	IsInterface  bool
 	Description  string
 	ExampleValue string
 	// DefaultValue is the constructor default in the same output form that
@@ -240,6 +241,7 @@ func buildHintFromArg(arg *core.FunctionArg) (constructorArgHint, bool) {
 		TypeLabel:    typeLabel,
 		IsList:       arg.TypeDef.Self().Kind == core.TypeDefKindList,
 		IsObject:     arg.TypeDef.Self().Kind == core.TypeDefKindObject,
+		IsInterface:  arg.TypeDef.Self().Kind == core.TypeDefKindInterface,
 		Description:  arg.Description,
 		ExampleValue: exampleValue,
 		DefaultValue: formatDefaultAsOutput(arg.DefaultValue),
@@ -282,6 +284,13 @@ func typeInfoFromTypeDef(td *core.TypeDef) (typeLabel, exampleValue string, conf
 				return objName, example, true
 			}
 		}
+	case core.TypeDefKindInterface:
+		if td.AsInterface.Valid && td.AsInterface.Value.Self() != nil {
+			// Interface settings wire in another module's function: the value is
+			// a module function reference rather than an address.
+			return td.AsInterface.Value.Self().Name,
+				"\"" + workspace.ModuleRefPlaceholder + "\"", true
+		}
 	case core.TypeDefKindList:
 		if td.AsList.Valid && td.AsList.Value.Self() != nil {
 			elemTypeDef := td.AsList.Value.Self().ElementTypeDef.Self()
@@ -296,6 +305,8 @@ func typeInfoFromTypeDef(td *core.TypeDef) (typeLabel, exampleValue string, conf
 				example = "[0.0]"
 			case elemConfigurable && elemTypeDef != nil && elemTypeDef.Kind == core.TypeDefKindString:
 				example = `[""]`
+			case elemConfigurable && elemTypeDef != nil && elemTypeDef.Kind == core.TypeDefKindInterface:
+				example = "[\"" + workspace.ModuleRefPlaceholder + "\"]"
 			}
 			return "[]" + elemLabel, example, elemConfigurable
 		}
